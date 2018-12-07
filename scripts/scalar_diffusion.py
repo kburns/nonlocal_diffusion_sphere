@@ -1,3 +1,5 @@
+"""Simulation script."""
+
 import ball_wrapper as ball
 import ball128
 import numpy as np
@@ -19,8 +21,22 @@ import pickle
 import logging
 logger = logging.getLogger(__name__)
 
+
+# Parameters
 def lambda_function(ell):
+    """BC operator eigenvalues."""
     return 1
+
+def f(m,ell):
+    """BC RHS forcing."""
+    if ell == 0:
+        return 0
+    elif ell < 10:
+        rand = np.random.randn() + 1j * np.random.randn()
+        return rand
+    else:
+        return 0
+
 
 # Gives LHS matrices for boussinesq
 def matrices(N,ell):
@@ -96,8 +112,8 @@ rank = comm.rank
 size = comm.size
 
 # Resolution
-L_max = 31
-N_max = 31
+L_max = 63
+N_max = 63
 R_max = 2
 
 alpha_BC = 0
@@ -106,15 +122,16 @@ L_dealias = 3/2
 N_dealias = 3/2
 
 # Integration parameters
-dt = 8e-5
-t_end = 20
+dt = 1e-3
+t_end = 0.1
+output_cadence = 10
 
 # Make domain
-mesh=[1]
-phi_basis = de.Fourier('phi',2*(L_max+1), interval=(0,2*np.pi),dealias=L_dealias)
-theta_basis = de.Fourier('theta', L_max+1, interval=(0,np.pi),dealias=L_dealias)
-r_basis = de.Fourier('r', N_max+1, interval=(0,1),dealias=N_dealias)
-domain = de.Domain([phi_basis,theta_basis,r_basis], grid_dtype=np.float64, mesh=mesh)
+mesh=[2,2]
+phi_basis = de.Fourier('phi',2*(L_max+1), interval=(0,2*np.pi), dealias=L_dealias)
+theta_basis = de.Fourier('theta', L_max+1, interval=(0,np.pi), dealias=L_dealias)
+r_basis = de.Fourier('r', N_max+1, interval=(0,1), dealias=N_dealias)
+domain = de.Domain([phi_basis, theta_basis, r_basis], grid_dtype=np.float64, mesh=mesh)
 
 domain.global_coeff_shape = np.array([L_max+1,L_max+1,N_max+1])
 domain.distributor = Distributor(domain,comm,mesh)
@@ -159,11 +176,6 @@ r = B.grid(2,dimensions=3)[:,:,grid_slices[2]] # local
 weight_theta = B.weight(1,dimensions=3)[:,grid_slices[1],:]
 weight_r = B.weight(2,dimensions=3)[:,:,grid_slices[2]]
 
-# RHS BC
-def f(m,ell):
-    if ell==0: return 0
-    else: return 0*ell**(-4)
-
 # BC array
 local_rell_shape = r_ell_layout.local_shape(scales=domain.dealias)
 BC_shape = np.array(local_rell_shape)[:-1]
@@ -179,7 +191,7 @@ T  = ball.TensorField_3D(0,B,domain)
 T_rhs = ball.TensorField_3D(0,B,domain)
 
 # initial condition
-T['g'] = 0.5*(1-r**2) + 0.1/8.*np.sqrt(35/np.pi)*r**3*(1-r**2)*(np.cos(3*phi)+np.sin(3*phi))*np.sin(theta)**3
+T['g'] = 50 * (0.5*(1-r**2) + 1/8.*np.sqrt(35/np.pi)*r**3*(1-r**2)*(np.cos(3*phi)+np.sin(3*phi))*np.sin(theta)**3)
 
 # build state vector
 state_vector = StateVector(T)
@@ -202,17 +214,15 @@ def nonlinear(state_vector, RHS, t):
     # get U in coefficient space
     state_vector.unpack(T)
 
-    T_rhs.layout = 'g'
-    T_rhs['g'] = 0*T['g']
+    # T_rhs.layout = 'g'
+    # T_rhs['g'] = 0*T['g']
 
-    # transform (ell, r) -> (ell, N)
-    for ell in range(ell_start, ell_end+1):
-        ell_local = ell - ell_start
-
-        N = N_max - B.N_min(ell-R_max)
-
-        # multiply by conversion matrices (may be very important)
-        T_rhs['c'][ell_local] = M[ell_local][:-1,:-1]@T_rhs['c'][ell_local]
+    # # transform (ell, r) -> (ell, N)
+    # for ell in range(ell_start, ell_end+1):
+    #     ell_local = ell - ell_start
+    #     N = N_max - B.N_min(ell-R_max)
+    #     # multiply by conversion matrices (may be very important)
+    #     T_rhs['c'][ell_local] = M[ell_local][:-1,:-1]@T_rhs['c'][ell_local]
 
     NL.pack(T_rhs,BC)
 
@@ -246,6 +256,7 @@ def backward_state(state_vector):
 # timestepping loop
 start_time = time.time()
 iter = 0
+output_num = 0
 
 while t < t_end:
     # Output
@@ -255,14 +266,13 @@ while t < t_end:
         logger.info("iter: {:d}, dt={:e}, t/t_e={:e}, Tmax={:e}".format(iter, dt, t/t_end, Tmax))
         if rank == 0:
             t_list.append(t)
-    if iter % 100 == 0:
+    if iter % output_cadence == 0:
         T_grid = backward_state(state_vector)
         if rank == 0:
-            output_num = iter // 5
-            file = open('checkpoint_L%i' %output_num, 'wb')
-            for a in [T_grid, phi, theta, r]:
-                pickle.dump(a,file)
-            file.close()
+            data = {'T': T_grid, 'phi': phi, 'theta': theta_global, 'r': r_global, 'iteration': iter, 'time': t}
+            with open('checkpoints/checkpoint_%i.pkl' %output_num, 'wb') as file:
+                pickle.dump(data,file)
+        output_num += 1
     # Timestep
     nonlinear(state_vector,NL,t)
     timestepper.step(dt, state_vector, B, L, M, P, NL, LU)
@@ -272,7 +282,4 @@ while t < t_end:
 end_time = time.time()
 if rank==0:
     print('simulation took: %f' %(end_time-start_time))
-    t_list = np.array(t_list)
-    E_list = np.array(E_list)
-    np.savetxt('E.dat',np.array([t_list,E_list]))
 
